@@ -1,0 +1,515 @@
+import os
+from os.path import join
+import re
+from bs4 import BeautifulSoup
+import elasticsearch
+from elasticsearch import client
+from collections import defaultdict
+import string
+import math
+import json
+es = elasticsearch.Elasticsearch("localhost:9200", timeout=600, max_retries=2, revival_delay=0)
+idx = elasticsearch.client.IndicesClient(es)
+
+queryResults = {}
+queryList = {}
+docLength = {}
+averageLength = 202.588
+totalDocs = 84678
+vocabulary = 178,050.0
+totalDocLength = 0
+totalTermFrequencyDict = {}
+
+def getTotalDocLength():
+    global totalDocLength
+    for docId in docLength:
+        totalDocLength += docLength[docId]
+    print totalDocLength
+    
+def searchTerm(query, termSearchResults):
+    #query = 'allegations'
+    countOfDocs = getCountOfDocs()
+    results = es.search(index='ap_data1', doc_type = 'document', q = 'corpusCollection:' + query,size=countOfDocs['count'])
+    #print results['hits']['hits']
+    numOfDocsLimit = 150;
+    docIDs = [doc['_id'] for doc in results['hits']['hits']]
+    if docIDs:
+        groupofDocs = [docIDs[x:x+numOfDocsLimit] for x in xrange(0, len(docIDs), numOfDocsLimit)]
+        for docs in groupofDocs:
+            v = es.mtermvectors(index='ap_data1', doc_type='document', ids=docs, fields='corpusCollection',field_statistics=True,term_statistics = True)
+            ttf=0
+            df=0
+            tf = 0
+            for doc in v['docs']:
+                if docLength.has_key(doc['_id']):
+                    pass
+                else:
+                    calculateDocLength(doc, v['docs']) 
+                termVectorList = []
+                #ttf+=doc['term_vectors']['corpusCollection']['terms'][query]['term_freq']
+                #df+=doc['term_vectors']['corpusCollection']['terms'][query]['doc_freq']
+                if query in doc['term_vectors']['corpusCollection']['terms']:
+                    tf = doc['term_vectors']['corpusCollection']['terms'][query]['term_freq']
+                    df = doc['term_vectors']['corpusCollection']['terms'][query]['doc_freq']  
+                    termVectorList.append(tf)
+                    termVectorList.append(df)
+                #termVectorList.append(ttf)
+                    termSearchResults[doc['_id']] = termVectorList
+                #print tf
+                #print doc['_id']
+                #print termVectorList
+        #print df
+        return termSearchResults
+
+def searchTerm1(query, termSearchResults):
+    #query = 'allegations'
+    countOfDocs = getCountOfDocs()
+    results = es.search(index='ap_data1', doc_type='document', body='{"query" : {"query_string" : {"query" :' + ' "' + query + '"' + '}}, "explain" : true}', size=countOfDocs['count'])
+    #print results['hits']['hits']
+    ttf = 0.0
+    for document in results['hits']['hits']:
+        termVectorList = []
+        #ttf+=doc['term_vectors']['corpusCollection']['terms'][query]['term_freq']
+        #df+=doc['term_vectors']['corpusCollection']['terms'][query]['doc_freq']
+        description = json.dumps(document['_explanation'])
+        termFreq = description.find("termFreq")
+        docFreq = description.find("docFreq")
+        maxDocs= description.find("maxDocs")
+        tf =  description[termFreq:termFreq+13]
+        df = description[docFreq:maxDocs-1]
+        tf = tf[9:-1]
+        df = df[8:-1]
+        if '=' in tf:
+            tf = tf.replace('=','')
+        ttf += float(tf)
+        termVectorList.append(tf)
+        termVectorList.append(int(df))    
+        #termVectorList.append(ttf)
+        termSearchResults[document['_id']] = termVectorList
+                #print tf
+                #print doc['_id']
+                #print termVectorList
+        #print df
+    totalTermFrequencyDict[query] = ttf
+    return termSearchResults
+    
+def calculateDocLength(doc, v):
+    docLen = 0
+    for term in doc['term_vectors']['corpusCollection']['terms']:
+        docLen += doc['term_vectors']['corpusCollection']['terms'][term]['term_freq']
+    docLength[doc['_id']] = docLen    
+    
+def averageLengthOfDoc():
+    totalLength = 0
+    for doc in docLength:
+        totalLength += docLength[doc]
+    averageLength = totalLength/84661
+           
+def cleanQueryFile():
+    queryTextFile = "D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/query_desc.51-100.short.txt"
+    file = open(queryTextFile, "r")
+    queryFile = []
+    for line in file:
+        if ('(' in line):
+            line = line.replace('(','')
+        if (')' in line):
+            line = line.replace(')','')
+        if ('"' in line):
+            line = line.replace('"','')
+        terms = line.split();
+        for x in range(1,3):
+            terms.pop(1)
+        queryFile.append(terms)
+    return queryFile
+
+def getQueriesResults(): 
+    queryFile = cleanQueryFile()
+    storeLenOfDocs()
+    getTotalDocLength()
+    #queryNumberList = getQueryNumberList(queryFile)
+    stopwords = []
+    stopwordFile = "D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/stoplist.txt"
+    stopFile = open(stopwordFile, "r")
+    for stopword in stopFile:
+        stopwords.append(stopword.strip())
+    for query in queryFile:
+        #print query
+        queryTermCountDict = {}
+        singleTermResults = defaultdict(defaultdict)
+        queryNumber = query.pop(0)
+        queryNumber = queryNumber[:-1]
+        for x in range(1, len(query)):
+            termSearchResults = defaultdict(list)
+            term = query.pop(1)
+            if term[len(term) - 1] in string.punctuation:
+                term = term[:-1] 
+            #print term
+            if queryTermCountDict.has_key(term):
+                queryTermCountDict[term] += 1
+            else:
+                queryTermCountDict[term] = 1
+            if term not in stopwords:   
+                termVector = searchTerm1(term, termSearchResults)
+                singleTermResults[term]=termVector
+        queryResults[queryNumber] = singleTermResults
+    #print queryResults
+        getTermVectors(queryResults, queryNumber, queryTermCountDict)
+        #rankOkapiTFDocuments(queryNumber)
+        #rankTFIDFDocuments(queryNumber)
+
+
+    
+def getTermVectors(queryResults, queryNumber, queryTermCountDict):
+    okapiTFDict = {}
+    tfIDFDict = {}
+    okapiBM125Dict = {}
+    laplaceSmoothingDict = {}
+    jelinekMercerSmoothingDict = {}
+    termResults = queryResults[queryNumber]
+    for term in termResults:
+        if termResults[term] is not None:
+            getOkapiTFAndIDF(term, termResults[term], queryNumber, okapiTFDict, tfIDFDict)
+            getOkapiBM125(term, termResults[term], queryNumber, okapiBM125Dict, queryTermCountDict)
+            getLaplaceSmoothing(term, termResults[term], queryNumber, laplaceSmoothingDict)
+            getJelinekMercerSmoothing(term, termResults[term], queryNumber, jelinekMercerSmoothingDict)
+    rankOkapiTFDocuments(queryNumber, okapiTFDict)
+    rankTFIDFDocuments(queryNumber, tfIDFDict)
+    rankLaplaceSmoothingDocuments(queryNumber, laplaceSmoothingDict)
+    rankOkapiBM125Documents(queryNumber, okapiBM125Dict)
+    rankJelinekMercerSmoothingDocuments(queryNumber, jelinekMercerSmoothingDict)
+        
+    
+
+def getJelinekMercerSmoothing(term, termResults, queryNumber, jelinekMercerSmoothingDict):
+    tf = 0
+    df= 0
+    docLen = 0
+    constant = 0.4
+    for docId in docLength:
+        if docId not in termResults:
+            if docLength.has_key(docId):
+                docLen = docLength[docId]
+            ttfWithoutDoc = totalTermFrequencyDict[term] - float(tf)
+            docLenWithoutDoc = totalDocLength - float(docLen)
+            calc2 = 0.6 * (float(ttfWithoutDoc)/docLenWithoutDoc)
+            p_jm = math.log10(calc2)
+        else:
+    #for docId in termResults:
+            if docLength.has_key(docId):
+                docLen = docLength[docId]
+            tf = termResults[docId][0]
+            calc1 = constant * (float(tf)/docLen)
+            ttfWithoutDoc = totalTermFrequencyDict[term] - float(tf)
+            docLenWithoutDoc = totalDocLength - float(docLen)
+            calc2 = 0.6 * (float(ttfWithoutDoc)/docLenWithoutDoc)
+            p_jm = math.log10(calc1 + calc2)
+        if docId in jelinekMercerSmoothingDict:
+            jelinekMercerSmoothingDict[docId] += p_jm
+        else:
+            jelinekMercerSmoothingDict[docId] = p_jm
+        
+def getLaplaceSmoothing(term, termResults, queryNumber, laplaceSmoothingDict):
+    tf = 0
+    df= 0
+    docLen = 0
+    #termsScoreOfDoc = {}
+    for docId in docLength:
+        if docId not in termResults:
+            if docLength.has_key(docId):
+                docLen = docLength[docId]
+            calc2 = float(docLen) + 178050.0
+            p_laplace = math.log(1.0/calc2)
+        else:
+    #for docId in termResults:
+            tf = termResults[docId][0]
+            if docLength.has_key(docId):
+                docLen = docLength[docId]
+            calc1 = float(tf) + 1.0
+            calc2 = float(docLen) + 178050.0
+            p_laplace = math.log(calc1/calc2)
+            '''if laplaceSmoothingDocFinalScoreForQuery.has_key(queryNumber):
+                allDocsScore = laplaceSmoothingDocFinalScoreForQuery.get(queryNumber)
+                if docId in allDocsScore:
+                    #okapiTFScoreDoc = allDocsScore.get(docId)
+                    #okapiTFScoreDoc += okapiTFTerm
+                    allDocsScore[docId] += p_laplace
+                else:
+                    allDocsScore[docId] = p_laplace
+                laplaceSmoothingDocFinalScoreForQuery[queryNumber] = allDocsScore
+            else:
+                allDocsScore = {}
+                allDocsScore[docId] = p_laplace
+                laplaceSmoothingDocFinalScoreForQuery[queryNumber] = allDocsScore'''
+        if docId in laplaceSmoothingDict:
+            laplaceSmoothingDict[docId] += p_laplace
+        else:
+            laplaceSmoothingDict[docId] = p_laplace
+    #print laplaceSmoothingDocFinalScoreForQuery
+    
+        
+
+def getOkapiBM125(term, termResults, queryNumber, okapiBM125Dict, queryTermCountDict):
+    tf = 0
+    df= 0
+    docLen = 0
+    calc1 = 0.0
+    calc2 = 0.0
+    calc = 0.0
+    calc3 = 0.0
+    calc4 = 0.0
+    #termsScoreOfDoc = {}
+    for docId in termResults:
+        tf = termResults[docId][0]
+        df = termResults[docId][1]
+        if docLength.has_key(docId):
+            docLen = docLength[docId]
+        #okapiTF = float(tf)/(float(tf) + 0.5 + (1.5*(float(docLen)/averageLength)))
+        #print okapiTF
+        calc = float(docLen)/averageLength
+        calc1 = 0.25 + (0.75 * calc)
+        calc2 = float(tf) + (1.2 * calc1)
+        calc3 = float(tf) + (1.2 * float(tf))
+        calc4 = calc3 / calc2
+        calc5= (float(totalDocs) + 0.5)/(float(df) + 0.5)
+        calc6 = math.log10(calc5)
+        tfq = queryTermCountDict.get(term)
+        calc7 = float(tfq) + (5.0 * float(tfq))
+        calc8 = float(tfq) + 5.0
+        calc9 = calc7 / calc8
+        okapiBM125 = calc6 * calc4 * calc9
+        if docId in okapiBM125Dict:
+            okapiBM125Dict[docId] += okapiBM125
+        else:
+            okapiBM125Dict[docId] = okapiBM125
+    #print "Bye"
+            
+def getOkapiTFAndIDF(term, termResults, queryNumber, okapiTFDict, tfIDFDict):
+    tf = 0
+    df= 0
+    docLen = 0
+    calc1 = 0.0
+    calc2 = 0.0
+    calc = 0.0
+    calc3 = 0.0
+    calc4 = 0.0
+    #termsScoreOfDoc = {}
+    for docId in termResults:
+        tf = termResults[docId][0]
+        df = termResults[docId][1]
+        if docLength.has_key(docId):
+            docLen = docLength[docId]
+        #okapiTF = float(tf)/(float(tf) + 0.5 + (1.5*(float(docLen)/averageLength)))
+        #print okapiTF
+        calc1 = float(docLen)/averageLength
+        calc = 1.5 * calc1
+        calc2 = float(tf) + 0.5 + calc
+        okapiTFTerm = float(tf)/calc2
+        calc3 = totalDocs/df
+        calc4 = math.log10(calc3)
+        tfIDF = okapiTFTerm * calc4
+        #print okapiTF
+        #print termResults[docId]
+        '''if okapiTFDoc.has_key(docId):
+            termsScoreOfDoc = okapiTFDoc.get(docId)
+            termsScoreOfDoc[term] = okapiTFTerm
+            okapiTFDoc[docId] = termsScoreOfDoc
+        else:
+            termsScoreOfDoc = {}
+            termsScoreOfDoc[term] = okapiTFTerm
+            okapiTFDoc[docId] =  termsScoreOfDoc'''
+        '''if okapiDocFinalScoreForQuery.has_key(queryNumber):
+            allDocsScore = okapiDocFinalScoreForQuery.get(queryNumber)
+            if docId in allDocsScore:
+                #okapiTFScoreDoc = allDocsScore.get(docId)
+                #okapiTFScoreDoc += okapiTFTerm
+                allDocsScore[docId] += okapiTFTerm
+            else:
+                allDocsScore[docId] = okapiTFTerm
+            okapiDocFinalScoreForQuery[queryNumber] = allDocsScore
+        else:
+            allDocsScore = {}
+            allDocsScore[docId] = okapiTFTerm
+            okapiDocFinalScoreForQuery[queryNumber] = allDocsScore
+        if tfIDFDocFinalScoreForQuery.has_key(queryNumber):
+            allDocsScore = tfIDFDocFinalScoreForQuery.get(queryNumber)
+            if docId in allDocsScore:
+                #okapiTFScoreDoc = allDocsScore.get(docId)
+                #okapiTFScoreDoc += okapiTFTerm
+                allDocsScore[docId] += tfIDF
+            else:
+                allDocsScore[docId] = tfIDF
+            tfIDFDocFinalScoreForQuery[queryNumber] = allDocsScore
+        else:
+            allDocsScore = {}
+            allDocsScore[docId] = tfIDF
+            tfIDFDocFinalScoreForQuery[queryNumber] = allDocsScore'''
+        if docId in okapiTFDict:
+            okapiTFDict[docId] += okapiTFTerm
+        else:
+            okapiTFDict[docId] = okapiTFTerm
+        if docId in tfIDFDict:
+            tfIDFDict[docId] += tfIDF
+        else:
+            tfIDFDict[docId] = tfIDF
+    #print okapiTFDoc
+    #print okapiDocFinalScoreForQuery
+    #print tfIDFDocFinalScoreForQuery
+    #print okapiTFDict
+
+def rankOkapiTFDocuments(queryNumber, okapiTFDict):
+    f = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/qrelokapi.txt","a")
+    top = 1
+    #if okapiDocFinalScoreForQuery.has_key(queryNumber):
+        #dict1 = okapiDocFinalScoreForQuery.get(queryNumber)
+    for docId in sorted(okapiTFDict, key=okapiTFDict.get, reverse=True):
+        if top <= 1000:
+            qrelString = queryNumber + " Q0 " + docId + " " + str(top) + " " + str(okapiTFDict[docId]) + " " + "Exp" 
+            f.write(qrelString + "\n")
+            top += 1
+        else:
+            break
+
+def rankTFIDFDocuments(queryNumber, tfIDFDict):
+    f = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/qreltfidf.txt","a")
+    top = 1
+    #if tfIDFDocFinalScoreForQuery.has_key(queryNumber):
+        #dict1 = tfIDFDocFinalScoreForQuery.get(queryNumber)
+    for docId in sorted(tfIDFDict, key=tfIDFDict.get, reverse=True):
+        if top <= 1000:
+            qrelString = queryNumber + " Q0 " + docId + " " + str(top) + " " + str(tfIDFDict[docId]) + " " + "Exp" 
+            f.write(qrelString + "\n")
+            top += 1
+        else:
+            break
+
+def rankLaplaceSmoothingDocuments(queryNumber, laplaceSmoothingDict):
+    f = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/qrellaplace.txt","a")
+    top = 1
+    #if tfIDFDocFinalScoreForQuery.has_key(queryNumber):
+        #dict1 = tfIDFDocFinalScoreForQuery.get(queryNumber)
+    for docId in sorted(laplaceSmoothingDict, key=laplaceSmoothingDict.get, reverse=True):
+        if top <= 1000:
+            qrelString = queryNumber + " Q0 " + docId + " " + str(top) + " " + str(laplaceSmoothingDict[docId]) + " " + "Exp" 
+            f.write(qrelString + "\n")
+            top += 1
+        else:
+            break
+        
+def rankOkapiBM125Documents(queryNumber, okapiBM125Dict):
+    f = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/qrelokapiBM125.txt","a")
+    top = 1
+    #if tfIDFDocFinalScoreForQuery.has_key(queryNumber):
+        #dict1 = tfIDFDocFinalScoreForQuery.get(queryNumber)
+    for docId in sorted(okapiBM125Dict, key=okapiBM125Dict.get, reverse=True):
+        if top <= 1000:
+            qrelString = queryNumber + " Q0 " + docId + " " + str(top) + " " + str(okapiBM125Dict[docId]) + " " + "Exp" 
+            f.write(qrelString + "\n")
+            top += 1
+        else:
+            break
+        
+def rankJelinekMercerSmoothingDocuments(queryNumber, jelinekMercerSmoothingDict):
+    f = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/qreljelinekmercer.txt","a")
+    top = 1
+    #if tfIDFDocFinalScoreForQuery.has_key(queryNumber):
+        #dict1 = tfIDFDocFinalScoreForQuery.get(queryNumber)
+    for docId in sorted(jelinekMercerSmoothingDict, key=jelinekMercerSmoothingDict.get, reverse=True):
+        if top <= 1000:
+            qrelString = queryNumber + " Q0 " + docId + " " + str(top) + " " + str(jelinekMercerSmoothingDict[docId]) + " " + "Exp" 
+            f.write(qrelString + "\n")
+            top += 1
+        else:
+            break
+        
+def getCountOfDocs():
+    countOfDocs = es.count(index='ap_data1', doc_type='document')
+    return countOfDocs
+                   
+def getQueryNumberList(queryFile):
+    queryNumberList=[]
+    for query in queryFile:
+        queryNumber = query.pop(0)
+        queryNumber = queryNumber[:-1]
+        queryNumberList.append(queryNumber)
+    return queryNumberList   
+
+def generateResults():
+    #cleanQueryFile()
+    #getDocumentLength()
+    #getQueriesResults()
+    #rankDocuments()
+    searchTerm2()
+
+def getDocumentLength():
+    countOfDocs = getCountOfDocs()
+    results = es.search(index='ap_data1', doc_type = 'document', body={"query" : {"match_all" : {}}}, size=countOfDocs['count'])
+    documents = [doc['_id'] for doc in results['hits']['hits']]
+    print len(results['hits']['hits'])
+    results = {}
+    numOfDocsLimit = 200
+    global totalDocLength
+    docLenFile = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/docLength.txt","a")
+    docIDs = [doc for doc in documents]
+    if docIDs:
+        groupofDocs = [docIDs[x:x+numOfDocsLimit] for x in xrange(0, len(docIDs), numOfDocsLimit)]
+        for docs in groupofDocs:
+            v = es.mtermvectors(index='ap_data1', doc_type='document', ids=docs, fields='corpusCollection',field_statistics=True,term_statistics = True)
+            for doc in v['docs']:
+                if doc['term_vectors'].has_key('corpusCollection'):
+                    #print len(doc['term_vectors']['corpusCollection']['terms'])
+                    totalDocLength += len(doc['term_vectors']['corpusCollection']['terms'])
+                    docLenFile.write(doc['_id'] + " " + str(len(doc['term_vectors']['corpusCollection']['terms'])) + "\n")
+                    #docLength[doc['_id']] = len(doc['term_vectors']['corpusCollection']['terms'])
+                else:
+                    docLenFile.write(doc['_id'] + " " + str(0) + "\n")
+                    #docLength[doc['_id']] = 0
+    print len(documents)
+    global averageLength
+    averageLength = float(totalDocLength)/totalDocs
+    print averageLength
+    #print len(docLength)  
+
+def storeLenOfDocs():
+    global docLength
+    file = open("D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/docLength.txt","r")
+    for line in file:
+        lengths = line.split();
+        docLength[lengths[0]] = int(lengths[1])
+
+def searchTerm2():
+    query = 'celluloid'
+    countOfDocs = getCountOfDocs()
+    results = es.search(index='ap_data1', doc_type='document', body='{"query" : {"query_string" : {"query" :' + ' "' + query + '"' + '}}, "explain" : true}', size=countOfDocs['count'])
+    print results['hits']['hits']
+    ttf = 0
+    for document in results['hits']['hits']:
+        print document['_id']
+        '''termVectorList = []
+        #ttf+=doc['term_vectors']['corpusCollection']['terms'][query]['term_freq']
+        #df+=doc['term_vectors']['corpusCollection']['terms'][query]['doc_freq']
+        d = json.dumps(document['_explanation'])
+        print d
+        x = d.find("termFreq")
+        y = d.find("docFreq")
+        z= d.find("maxDocs")
+        tf =  d[x:x+13]
+        df = d[y:z-1]
+        tf = tf[9:-1]
+        df = df[8:-1]
+        if '=' in tf:
+            tf = tf.replace('=','')
+        ttf += float(tf)
+        termVectorList.append(tf)
+        termVectorList.append(int(df)) 
+    totalTermFrequencyDict[query] = ttf   
+        #termVectorList.append(ttf)
+        #termSearchResults[document['_id']] = termVectorList
+                #print tf
+                #print doc['_id']
+                #print termVectorList
+        #print df
+    #return termSearchResults
+    print totalTermFrequencyDict[query]'''
+    
+
+generateResults()
