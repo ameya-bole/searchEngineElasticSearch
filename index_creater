@@ -1,0 +1,82 @@
+import os
+from os.path import join
+import re
+from bs4 import BeautifulSoup
+import elasticsearch
+from elasticsearch import client
+from collections import defaultdict
+import string
+import math
+import json
+es = elasticsearch.Elasticsearch("localhost:9200", timeout=600, max_retries=2, revival_delay=0)
+idx = elasticsearch.client.IndicesClient(es)
+
+
+def parseDocuments():
+    path = "D:/Information Retreival/Assignment 1/AP89_DATA/AP_DATA/ap89_collection/"
+    listOfFiles = os.listdir(path);
+    for i in listOfFiles:
+        
+        f = open(join(path,i),"r").read()
+        documents = re.findall('<DOC>.*?</DOC>',f,re.DOTALL)
+        docNumbers = []
+        docTexts = []
+        i=0
+        for document in documents:
+            docNumberField = re.search('<DOCNO>.*</DOCNO>',document)
+            soup = BeautifulSoup(docNumberField.group())
+            docNumber = soup.find('docno').text
+            docNumbers.append(docNumber.strip())
+            docText = []
+            docTextField = re.findall('<TEXT>.*?</TEXT>',document,re.DOTALL)
+            for text in docTextField:
+                soup2 = BeautifulSoup(text)
+                docText.append(soup2.find('text').text.strip().replace('\n',' '))
+            docTexts.append(docText)
+            addCorpusToIndex(docNumbers[i], docTexts[i])
+            i=i+1
+            
+
+def createIndex():
+    idx.create(index = 'ap_data1',
+                 body='' +
+                    '{"mappings": {' +
+                    '"document": {' +
+                    '"properties": {' + 
+                        '"docno": {' +
+                            '"type": "string",'+
+                            '"store": true,'+
+                            '"index": "not_analyzed"'+
+                            '},' +
+                            '"corpusCollection": {' +
+                            '"type": "string",' +
+                            '"term_vector": "with_positions_offsets_payloads",' +
+                            '"store": "yes",' +
+                            '"index_analyzer": "corpus_analyzer"}}}},' +
+                                '"settings": {' +      
+                                    '"index": {' +
+                                       '"store": {' +
+                                            '"type": "default"},' +
+                                               '"number_of_shards": 1,' +
+                                               '"number_of_replicas": 1},' +
+                                             '"analysis": {' +
+                                                  '"analyzer": {' +
+                                                       '"corpus_analyzer": {' + 
+                                                          '"type": "stop",'+
+                                                          '"stopwords": "_english_"}}}}}')
+    
+def deleteIndex():
+    idx.delete('ap_data1')
+    
+def addCorpusToIndex(documentId, documentText):
+    es.index(index='ap_data1', doc_type='document', id = documentId, 
+             body = {'corpusCollection':documentText, 'docno':documentId})
+    
+def loadIndices():
+    deleteIndex()
+    createIndex()
+    parseDocuments()
+    
+
+
+loadIndices()
